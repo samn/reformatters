@@ -5,6 +5,9 @@ import numpy as np
 import pandas as pd
 import pytest
 import xarray as xr
+from hypothesis import given, settings
+from hypothesis import strategies as st
+from hypothesis.extra.numpy import arrays
 
 from reformatters.common.deaccumulation import (
     PRECIPITATION_RATE_INVALID_BELOW_THRESHOLD,
@@ -1196,3 +1199,151 @@ def test_deaccumulate_non_reset_aligned_first_step_nan() -> None:
         rtol=1e-6,
         equal_nan=True,
     )
+
+
+# ---------------------------------------------------------------------------
+# Property-based tests
+#
+# The central correctness property is a round-trip: deaccumulation is the
+# inverse of accumulation. We generate physical per-step rates, integrate them
+# forward into the accumulated (or running-mean) values the source data would
+# contain, then assert deaccumulation recovers the original rates. Invariants:
+#   1. "accumulated" round-trip recovers integer rates exactly (float32-exact).
+#   2. The first step is always NaN; non-negative input never clamps or NaNs.
+#   3. The round-trip holds across parallelised leading/trailing dimensions.
+#   4. "running_mean" round-trip recovers the step rates.
+# ---------------------------------------------------------------------------
+
+
+def _build_accumulated(rates: np.ndarray, ratio: int, step_seconds: int) -> np.ndarray:
+    """Integrate per-step rates into accumulated values that reset every
+    ``ratio`` steps, matching deaccumulation's reset semantics."""
+    n = len(rates)
+    acc = np.zeros(n, dtype=np.float32)
+    cum = 0.0
+    for t in range(1, n):
+        cum += rates[t] * step_seconds  # integer, float32-exact below 2**24
+        acc[t] = cum
+        if t % ratio == 0:  # reset boundary -> next window starts from 0
+            cum = 0.0
+    return acc
+
+
+@settings(deadline=None, max_examples=300)
+@given(data=st.data())
+def test_deaccumulate_accumulated_round_trip(data: st.DataObject) -> None:
+    step_h = data.draw(st.sampled_from([1, 2, 3, 6]))
+    ratio = data.draw(st.integers(min_value=1, max_value=24 // step_h))
+    n = data.draw(st.integers(min_value=2, max_value=30))
+    # Integer rates keep accumulations exactly representable in float32
+    # (max accumulation 100 * 3600 * 24 < 2**24).
+    rates = data.draw(
+        arrays(np.int64, n, elements=st.integers(min_value=0, max_value=100))
+    )
+
+    step_seconds = step_h * SECONDS_PER_HOUR
+    accumulations = _build_accumulated(rates, ratio, step_seconds)
+    lead_times = pd.to_timedelta(np.arange(n) * step_h, unit="h")
+
+    data_array = xr.DataArray(
+        accumulations,
+        coords={"lead_time": lead_times},
+        dims=["lead_time"],
+        attrs={"units": "mm s-1"},
+    )
+    result = deaccumulate_to_rates_inplace(
+        data_array,
+        dim="lead_time",
+        reset_frequency=pd.Timedelta(hours=step_h * ratio),
+    )
+
+    assert np.isnan(result.values[0])  # first step is always NaN
+    assert not np.any(np.isnan(result.values[1:]))  # non-negative input: no NaN
+    np.testing.assert_array_equal(result.values[1:], rates[1:].astype(np.float32))
+
+
+@settings(deadline=None, max_examples=150)
+@given(data=st.data())
+def test_deaccumulate_accumulated_round_trip_multidim(data: st.DataObject) -> None:
+    step_h = data.draw(st.sampled_from([1, 3, 6]))
+    ratio = data.draw(st.integers(min_value=1, max_value=24 // step_h))
+    n = data.draw(st.integers(min_value=2, max_value=20))
+    rates = data.draw(
+        arrays(np.int64, n, elements=st.integers(min_value=0, max_value=50))
+    )
+    step_seconds = step_h * SECONDS_PER_HOUR
+    base = _build_accumulated(rates, ratio, step_seconds)
+
+    # (member, lead_time, y, x): member 1 has every rate doubled.
+    values = np.stack([base, 2 * base])[:, :, None, None]
+    lead_times = pd.to_timedelta(np.arange(n) * step_h, unit="h")
+
+    data_array = xr.DataArray(
+        values,
+        coords={
+            "ensemble_member": [0, 1],
+            "lead_time": lead_times,
+            "y": [0],
+            "x": [0],
+        },
+        dims=["ensemble_member", "lead_time", "y", "x"],
+        attrs={"units": "mm s-1"},
+    )
+    result = deaccumulate_to_rates_inplace(
+        data_array,
+        dim="lead_time",
+        reset_frequency=pd.Timedelta(hours=step_h * ratio),
+    )
+
+    expected_member = rates.astype(np.float32)
+    expected = np.stack([expected_member, 2 * expected_member])[:, :, None, None]
+    assert np.all(np.isnan(result.values[:, 0]))
+    np.testing.assert_array_equal(result.values[:, 1:], expected[:, 1:])
+
+
+@settings(deadline=None, max_examples=200)
+@given(data=st.data())
+def test_deaccumulate_running_mean_round_trip(data: st.DataObject) -> None:
+    step_h = data.draw(st.sampled_from([1, 2, 3]))
+    n = data.draw(st.integers(min_value=2, max_value=12))
+    rates = data.draw(
+        arrays(
+            np.float32,
+            n,
+            elements=st.floats(
+                min_value=0.0, max_value=100.0, width=32, allow_nan=False
+            ),
+        )
+    )
+
+    step_seconds = step_h * SECONDS_PER_HOUR
+    seconds = np.arange(n) * step_seconds
+    # Running mean A_t = (cumulative energy up to t) / t_seconds. Each rate
+    # applies to the interval (t-1, t], so index 0 contributes no energy.
+    contributions = rates.astype(np.float64) * step_seconds
+    contributions[0] = 0.0
+    energy = np.cumsum(contributions)
+    running_mean = np.zeros(n, dtype=np.float32)
+    running_mean[1:] = (energy[1:] / seconds[1:]).astype(np.float32)
+
+    data_array = xr.DataArray(
+        running_mean,
+        coords={"lead_time": pd.to_timedelta(np.arange(n) * step_h, unit="h")},
+        dims=["lead_time"],
+        attrs={"units": "W m-2"},
+    )
+    result = deaccumulate_to_rates_inplace(
+        data_array,
+        dim="lead_time",
+        reset_frequency=pd.Timedelta.max,
+        accumulation_type="running_mean",
+        invalid_below_threshold_rate=RADIATION_INVALID_BELOW_THRESHOLD,
+        # Disable the operational guards: float32 noise can push near-zero
+        # recovered rates slightly negative (then clamped to 0). We verify the
+        # recovery math here; atol absorbs those clamped near-zero values.
+        expected_clamp_fraction=1.0,
+        expected_invalid_fraction=1.0,
+    )
+
+    assert np.isnan(result.values[0])
+    np.testing.assert_allclose(result.values[1:], rates[1:], rtol=1e-2, atol=1e-1)
