@@ -56,6 +56,12 @@ def _round_float32_inplace_numba(
     flat_bits = bits.ravel()  # modify 1D view in place
 
     for i in prange(len(flat_bits)):  # ty: ignore[not-iterable]
+        # Leave non-finite values (inf, nan) unchanged. Their exponent is all
+        # ones; rounding their mantissa up can carry into that exponent and
+        # silently turn a nan into an inf, corrupting missing-data sentinels.
+        if (flat_bits[i] & exponent_mask) == exponent_mask:
+            continue
+
         mantissa = flat_bits[i] & mantissa_mask
         round_bit = flat_bits[i] & np.uint32(1 << drop_bits)
         half_bit = flat_bits[i] & np.uint32(1 << (drop_bits - 1))

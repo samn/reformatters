@@ -1,6 +1,11 @@
-import numpy as np
+from fractions import Fraction
 
-from reformatters.common.binary_rounding import round_float32_inplace
+import numpy as np
+from hypothesis import given, settings
+from hypothesis import strategies as st
+from hypothesis.extra.numpy import arrays
+
+from reformatters.common.binary_rounding import MANTISSA_BITS, round_float32_inplace
 
 
 def test_round_float32_negative_values() -> None:
@@ -380,3 +385,161 @@ def test_wide_logspace_percent_difference() -> None:
 
     assert max_diff > 0.0  # confirm that we have actually rounded the value
     assert max_diff < 0.5  # Less than 1/2 of 1% error
+
+
+# ---------------------------------------------------------------------------
+# Property-based tests
+#
+# Invariants exercised below:
+#   1. Matches an independent round-half-to-even reference (rational arithmetic).
+#   2. Special values (+/-0, +/-inf, NaN) are preserved.
+#   3. Idempotent: rounding an already-rounded value is a no-op.
+#   4. Order preserving (monotonic non-decreasing).
+#   5. Sign symmetric: round(-x) == -round(x).
+#   6. Finite results keep zeros in the dropped low mantissa bits.
+#   7. Relative error is bounded by 2**-keep_mantissa_bits for normal numbers.
+# ---------------------------------------------------------------------------
+
+_INF_BITS = np.uint32(0x7F800000)
+_SIGN_BIT = np.uint32(0x80000000)
+_SMALLEST_NORMAL_F32 = float(np.finfo(np.float32).tiny)
+
+
+def _round_reference(value: np.float32, keep_mantissa_bits: int) -> np.float32:
+    """Independent round-half-to-even reference.
+
+    Among the float32 values whose low ``23 - keep`` mantissa bits are zero, pick
+    the one nearest ``value``. Ties go to the candidate whose bit at the kept-LSB
+    position is zero (round to even). The nearest/tie decision is made with exact
+    rational arithmetic, so it does not reuse the bit logic under test.
+    """
+    if keep_mantissa_bits == MANTISSA_BITS or not np.isfinite(value) or value == 0:
+        return value
+
+    drop = MANTISSA_BITS - keep_mantissa_bits
+    bits = int(np.float32(value).view(np.uint32))
+    sign = bits & int(_SIGN_BIT)
+    magnitude = bits & 0x7FFFFFFF
+    step = 1 << drop
+
+    down = magnitude - (magnitude % step)  # truncate toward zero in magnitude
+    up = down + step
+
+    x = abs(Fraction(float(value)))
+    down_value = Fraction(float(np.uint32(down).view(np.float32)))
+    up_is_inf = up >= int(_INF_BITS)
+    if up_is_inf:
+        up_value = Fraction(2) ** 128  # hypothetical value one ULP past max float32
+    else:
+        up_value = Fraction(float(np.uint32(up).view(np.float32)))
+
+    dist_down = x - down_value
+    dist_up = up_value - x
+    if dist_up < dist_down:
+        choose_up = True
+    elif dist_up > dist_down:
+        choose_up = False
+    else:  # exact tie -> round to even (the candidate whose kept LSB is zero)
+        choose_up = ((down >> drop) & 1) == 1
+
+    if choose_up and up_is_inf:
+        return np.float32(np.inf if sign == 0 else -np.inf)
+
+    result_bits = (up if choose_up else down) | sign
+    return np.uint32(result_bits).view(np.float32)
+
+
+@settings(deadline=None, max_examples=500)
+@given(
+    value=st.floats(width=32, allow_nan=False, allow_infinity=False),
+    keep=st.integers(min_value=0, max_value=MANTISSA_BITS),
+)
+def test_round_matches_independent_reference(value: float, keep: int) -> None:
+    result = round_float32_inplace(np.array([value], dtype=np.float32), keep)[0]
+    expected = _round_reference(np.float32(value), keep)
+    # Both are float32; compare bit patterns to also catch signed-zero differences.
+    assert result.view(np.uint32) == np.float32(expected).view(np.uint32), (
+        f"value={value!r} keep={keep}: got {result!r}, expected {expected!r}"
+    )
+
+
+@settings(deadline=None, max_examples=200)
+@given(keep=st.integers(min_value=0, max_value=MANTISSA_BITS))
+def test_round_preserves_special_values(keep: int) -> None:
+    special = np.array([0.0, -0.0, np.inf, -np.inf, np.nan, -np.nan], dtype=np.float32)
+    result = round_float32_inplace(special.copy(), keep)
+    np.testing.assert_array_equal(result, special)  # treats NaN==NaN
+    # signed zero sign bit must be preserved exactly
+    assert result[0].view(np.uint32) == np.uint32(0)
+    assert result[1].view(np.uint32) == _SIGN_BIT
+
+
+@settings(deadline=None, max_examples=300)
+@given(
+    arr=arrays(
+        np.float32,
+        st.integers(min_value=1, max_value=64),
+        elements=st.floats(width=32),
+    ),
+    keep=st.integers(min_value=0, max_value=MANTISSA_BITS),
+)
+def test_round_is_idempotent(arr: np.ndarray, keep: int) -> None:
+    once = round_float32_inplace(arr.copy(), keep)
+    twice = round_float32_inplace(once.copy(), keep)
+    np.testing.assert_array_equal(once, twice)
+
+
+@settings(deadline=None, max_examples=300)
+@given(
+    arr=arrays(
+        np.float32,
+        st.integers(min_value=2, max_value=64),
+        elements=st.floats(width=32, allow_nan=False),
+    ),
+    keep=st.integers(min_value=0, max_value=MANTISSA_BITS),
+)
+def test_round_is_monotonic(arr: np.ndarray, keep: int) -> None:
+    ascending = np.sort(arr)  # places -inf first, +inf last, no NaN present
+    rounded = round_float32_inplace(ascending.copy(), keep)
+    assert np.all(rounded[:-1] <= rounded[1:])
+
+
+@settings(deadline=None, max_examples=500)
+@given(
+    value=st.floats(width=32, allow_nan=False),
+    keep=st.integers(min_value=0, max_value=MANTISSA_BITS),
+)
+def test_round_is_sign_symmetric(value: float, keep: int) -> None:
+    pos = round_float32_inplace(np.array([value], dtype=np.float32), keep)[0]
+    neg = round_float32_inplace(np.array([-value], dtype=np.float32), keep)[0]
+    # round(-x) == -round(x), including for +/-inf overflow
+    assert (-neg).view(np.uint32) == pos.view(np.uint32)
+
+
+@settings(deadline=None, max_examples=500)
+@given(
+    value=st.floats(width=32, allow_nan=False, allow_infinity=False),
+    keep=st.integers(min_value=0, max_value=MANTISSA_BITS - 1),
+)
+def test_round_clears_dropped_mantissa_bits(value: float, keep: int) -> None:
+    result = round_float32_inplace(np.array([value], dtype=np.float32), keep)[0]
+    if not np.isfinite(result):
+        return  # overflow to inf is allowed
+    drop = MANTISSA_BITS - keep
+    low_mantissa_bits = int(result.view(np.uint32)) & ((1 << drop) - 1)
+    assert low_mantissa_bits == 0
+
+
+@settings(deadline=None, max_examples=500)
+@given(
+    value=st.floats(
+        min_value=_SMALLEST_NORMAL_F32, max_value=2.0**100, width=32, allow_nan=False
+    ),
+    keep=st.integers(min_value=1, max_value=MANTISSA_BITS),
+)
+def test_round_relative_error_bounded(value: float, keep: int) -> None:
+    result = round_float32_inplace(np.array([value], dtype=np.float32), keep)[0]
+    if not np.isfinite(result):
+        return
+    relative_error = abs(float(result) - value) / value
+    assert relative_error <= 2.0**-keep
